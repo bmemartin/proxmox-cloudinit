@@ -1,0 +1,119 @@
+#!/bin/bash
+#
+# Assists with the creation of Proxmox templates using cloud-based images.
+
+set -e
+
+usage() {
+  echo """usage: `basename $0` [OPTIONS] IMAGE_URL
+
+  --cores         the number of cpu cores for the virtual machine (default: 1)
+  --id            the virtual machine identifier (default: 9000)
+  --memory        the amount of memory for the virtual machine (default: 2048)
+  --name          the virtual machine name (default: cloud-image)
+  --storage       the virtual machine disk storage (default: local-lvm)
+  --user-data     the path to the cloud-init user data (default: ./user-data.yaml)
+"""
+  exit 1
+}
+
+readonly IMAGE_DIR='/var/lib/vz/template/iso'
+USER_DATA_PATH='./user-data.yaml'
+VM_CORES=1
+VM_ID=9000
+VM_MEMORY=2048
+VM_NAME='cloud-image'
+VM_STORAGE='local-lvm'
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "${1}" in
+    --cores)
+      VM_CORES="${2}"
+      shift; shift; ;;
+    --id)
+      VM_ID="${2}"
+      shift; shift; ;;
+    --memory)
+      VM_MEMORY="${2}"
+      shift; shift; ;;
+    --name)
+      VM_NAME="${2}"
+      shift; shift; ;;
+    --storage)
+      VM_STORAGE="${2}"
+      shift; shift; ;;
+    --user-data)
+      USER_DATA_PATH="${2}"
+      shift; shift; ;;
+    -h|--help)
+      usage
+      shift; ;;
+    *)
+      POSITIONAL+=("${1}")
+      shift; ;;
+  esac
+done
+set -- "${POSITIONAL[@]}"
+readonly USER_DATA_PATH
+readonly VM_ID
+readonly VM_NAME
+readonly VM_CORES
+readonly VM_MEMORY
+readonly VM_STORAGE
+(( $# == 1 )) || usage
+
+
+create_template() {
+  local image_file="${1}"
+
+  # create a new virtual machine with VirtIO SCSI controller
+  qm create "${VM_ID}" --name "${VM_NAME}" --cores "${VM_CORES}" --memory "${VM_MEMORY}" --net0 virtio,bridge=vmbr0,firewall=1 --scsihw virtio-scsi-pci
+
+  # import the disk image to the target storage, attaching it as a SCSI drive
+  qm set "${VM_ID}" --scsi0 "${VM_STORAGE}:0,import-from=${IMAGE_DIR}/${image_file}"
+
+  # set a CD-ROM drive to be used to pass the cloud-init data to the virtual machine
+  qm set "${VM_ID}" --ide2 "${VM_STORAGE}:cloudinit"
+
+  # set the boot order to restrict the boot to the disk only
+  qm set "${VM_ID}" --boot order=scsi0
+
+  # set a serial console to be used as a display
+  qm set "${VM_ID}" --serial0 socket --vga serial0
+
+  # set the QEMU guest agent to enabled
+  qm set "${VM_ID}" --agent enabled=1
+
+  # set the cloud-init IPv4 address to DHCP
+  qm set "${VM_ID}" --ipconfig0 ip=dhcp
+
+  if [[ -f "${USER_DATA_PATH}" ]]; then
+    # create a specific cloud-init user data definition
+    cp "${USER_DATA_PATH}" "/var/lib/vz/snippets/${VM_ID}-user-data.yaml"
+
+    # set the custom cloud-init user data
+    qm set "${VM_ID}" --cicustom "user=local:snippets/${VM_ID}-user-data.yaml"
+  fi
+
+  # convert the virtual machine into a template
+  qm template "${VM_ID}"
+}
+
+download_image() {
+  local image_file="${1}"
+  local image_url="${2}"
+
+  if [[ ! -f "${IMAGE_DIR}/${image_file}" ]]; then
+    wget "${image_url}" -P "${IMAGE_DIR}/"
+  fi
+}
+
+main() {
+  local image_url="${1}"
+  local image_file="${image_url##*/}"
+
+  download_image "${image_file}" "${image_url}"
+  create_template "${image_file}"
+}
+
+main "$@"
